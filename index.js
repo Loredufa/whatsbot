@@ -2,14 +2,15 @@ import axios from 'axios';
 import 'dotenv/config';
 import express from 'express';
 import qrcode from 'qrcode-terminal';
-import { Buttons, Client, List, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import pkg from 'whatsapp-web.js';
+const { Buttons, Client, List, LocalAuth, MessageMedia } = pkg;
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
 // ---- Client con sesión persistente
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: process.env.SESSION_DIR || './sessions' }),
+  authStrategy: new LocalAuth({ dataPath: process.env.SESSION_DIR || './data' }),
   puppeteer: {
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
