@@ -1,144 +1,179 @@
-import axios from 'axios';
+// index.js (ESM, Windows-stable, maneja LOGOUT + EBUSY)
 import 'dotenv/config';
 import express from 'express';
-import qrcode from 'qrcode-terminal';
+import fetch from 'node-fetch';
 import pkg from 'whatsapp-web.js';
 const { Buttons, Client, List, LocalAuth, MessageMedia } = pkg;
 
+// ---------- Config ----------
+const PORT = process.env.PORT || 3000;
+const SESSION_DIR = process.env.SESSION_DIR || './data';
+const API_TOKEN = process.env.API_TOKEN || 'test123';
+const BROWSER_PATH =
+  process.env.BROWSER_PATH ||
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+
+// ---------- App HTTP ----------
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// ---- Client con sesión persistente
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: process.env.SESSION_DIR || './data' }),
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  }
-});
+const getToken = (req) => req.body?.token || req.headers['x-api-token'];
+const checkToken = (t) => t && String(t) === String(API_TOKEN);
 
-// ---- Eventos básicos
-client.on('qr', (qr) => {
-  console.log('Escaneá este QR (WhatsApp → Dispositivos vinculados):');
-  qrcode.generate(qr, { small: true });
-});
+// ---------- WhatsApp Client (una sola vez) ----------
+// --- una sola inicialización ---
+let client;
+let initialized = false;
+let WA_READY = false;
 
-client.on('ready', () => console.log('✅ WhatsApp listo'));
-client.on('authenticated', () => console.log('🔐 Autenticado'));
-client.on('auth_failure', (m) => console.error('❌ Falla de auth:', m));
-client.on('disconnected', (r) => { console.error('🔌 Desconectado:', r); client.initialize(); });
+function start() {
+  if (initialized) return;    // <-- GARANTÍA: 1 sola vez
+  initialized = true;
 
-// ---- Mensajes entrantes → reenvío a n8n
-client.on('message', async (msg) => {
-  try {
-    const payload = {
-      from: msg.from,             // '54911xxxxxxx@c.us'
-      body: msg.body || '',
-      timestamp: msg.timestamp,
-      type: msg.type,
-      hasMedia: msg.hasMedia
-    };
-
-    if (msg.hasMedia) {
-      const media = await msg.downloadMedia(); // { data(base64), mimetype, filename }
-      payload.media = {
-        mimetype: media.mimetype,
-        filename: media.filename || null,
-        data: media.data            // base64. En n8n podés guardarlo o reenviarlo
-      };
+  client = new Client({
+    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'wsbot1' }),
+    webVersionCache: { type: 'local' },
+    puppeteer: {
+      headless: true,
+      executablePath: BROWSER_PATH,
+      args: [
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+        '--disable-extensions','--disable-gpu','--no-first-run',
+        '--no-default-browser-check','--disable-crash-reporter',
+        '--disable-features=FirstPartySets,PrivacySandboxSettings3,Parakeet,UserAgentClientHint',
+        '--password-store=basic','--use-mock-keychain'
+      ]
     }
+  });
 
-    if (process.env.N8N_WEBHOOK_URL) {
-      await axios.post(process.env.N8N_WEBHOOK_URL, payload, { timeout: 10000 });
-    }
-  } catch (e) {
-    console.error('Error -> n8n:', e.message);
-  }
+  client.on('qr', qr => { /* QR */ });
+  client.on('authenticated', () => console.log('🔐 Autenticado'));
+  client.on('ready', () => { WA_READY = true; console.log('✅ WhatsApp listo'); });
+
+  // NO relanzar el cliente acá: si es LOGOUT, se reescanea manualmente
+  client.on('disconnected', async (reason) => {
+    WA_READY = false;
+    console.error('🔌 Desconectado:', reason);
+
+    // Soltar el navegador primero para evitar EBUSY al limpiar sesión
+    try { if (client.pupBrowser?.isConnected()) await client.pupBrowser.close(); } catch {}
+
+    // No tocar 'initialized' y NO llamar a start() de nuevo
+    console.error('ℹ️ Para reanudar: cerrar proceso (Ctrl+C), borrar carpeta de sesión y volver a iniciar para reescanear QR.');
+  });
+
+  client.initialize();
+}
+start();
+
+// ---------- Rutas ----------
+app.get('/status', (_req, res) => {
+  res.json({
+    ready: WA_READY,
+    me: client?.info?.wid?._serialized || null,
+  });
 });
 
-// ---- Helper
-const toJid = (to) => (to.endsWith('@c.us') ? to : `${to}@c.us`);
-const checkToken = (t) => t === process.env.API_TOKEN;
-
-// ---- Enviar texto
-// POST /send  { to: "54911...", message: "Hola", token: "..." }
 app.post('/send', async (req, res) => {
   try {
-    const { to, message, token } = req.body;
+    const token = getToken(req);
     if (!checkToken(token)) return res.status(401).json({ error: 'Unauthorized' });
-    if (!to || !message) return res.status(400).json({ error: 'to y message son requeridos' });
-    const resp = await client.sendMessage(toJid(to), message);
-    res.json({ ok: true, id: resp.id.id });
+    if (!WA_READY) return res.status(503).json({ error: 'Client not ready' });
+
+    const { to, message } = req.body;
+    if (!to || !message) return res.status(400).json({ error: 'Missing "to" or "message"' });
+
+    const numberId = await client.getNumberId(String(to));
+    if (!numberId) return res.status(404).json({ error: 'Number is not on WhatsApp' });
+
+    const chatId = numberId._serialized;
+    const sent = await client.sendMessage(chatId, message);
+    res.json({ to: chatId, id: sent.id?.id || null, ack: sent.ack });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---- Enviar media desde URL (imagen/audio/doc)
-// POST /send-media { to, url, caption?, token }
 app.post('/send-media', async (req, res) => {
   try {
-    const { to, url, caption, token } = req.body;
+    const token = getToken(req);
     if (!checkToken(token)) return res.status(401).json({ error: 'Unauthorized' });
-    if (!to || !url) return res.status(400).json({ error: 'to y url son requeridos' });
-    const media = await MessageMedia.fromUrl(url);
-    const resp = await client.sendMessage(toJid(to), media, { caption });
-    res.json({ ok: true, id: resp.id.id });
+    if (!WA_READY) return res.status(503).json({ error: 'Client not ready' });
+
+    const { to, url, caption } = req.body;
+    if (!to || !url) return res.status(400).json({ error: 'Missing "to" or "url"' });
+
+    const numberId = await client.getNumberId(String(to));
+    if (!numberId) return res.status(404).json({ error: 'Number is not on WhatsApp' });
+    const chatId = numberId._serialized;
+
+    const resp = await fetch(url);
+    if (!resp.ok) return res.status(400).json({ error: `Download failed: ${resp.status}` });
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const contentType = resp.headers.get('content-type') || 'application/octet-stream';
+    const filename = url.split('?')[0].split('/').pop() || 'file';
+
+    const media = new MessageMedia(contentType, buffer.toString('base64'), filename);
+    const sent = await client.sendMessage(chatId, media, { caption });
+    res.json({ to: chatId, id: sent.id?.id || null, ack: sent.ack, filename });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---- Enviar menú (Buttons)
-// POST /send-menu-buttons { to, title?, footer?, buttons:[{body:'Texto'}], token }
-app.post('/send-menu-buttons', async (req, res) => {
+app.post('/send-buttons', async (req, res) => {
   try {
-    const { to, buttons, title, footer, token } = req.body;
+    const token = getToken(req);
     if (!checkToken(token)) return res.status(401).json({ error: 'Unauthorized' });
-    if (!to || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ error: 'to y buttons[] son requeridos' });
+    if (!WA_READY) return res.status(503).json({ error: 'Client not ready' });
+
+    const { to, text, buttons = [], title, footer } = req.body;
+    if (!to || !text || !Array.isArray(buttons) || buttons.length === 0) {
+      return res.status(400).json({ error: 'Missing "to", "text" or non-empty "buttons" array' });
     }
-    const btn = new Buttons('Elegí una opción 👇', buttons, title || 'FG Concept', footer || 'Hair Studio');
-    const resp = await client.sendMessage(toJid(to), btn);
-    res.json({ ok: true, id: resp.id.id });
+
+    const numberId = await client.getNumberId(String(to));
+    if (!numberId) return res.status(404).json({ error: 'Number is not on WhatsApp' });
+    const chatId = numberId._serialized;
+
+    const btns = buttons.map((b) => ({ body: String(b) }));
+    const btnMsg = new Buttons(text, btns, title || '', footer || '');
+    const sent = await client.sendMessage(chatId, btnMsg);
+    res.json({ to: chatId, id: sent.id?.id || null, ack: sent.ack });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---- Enviar menú (List)
-// POST /send-menu-list { to, sections:[{title,rows:[{id,title,description?}]}], buttonText?, title?, footer?, token }
-app.post('/send-menu-list', async (req, res) => {
+// ---------- Shutdown ordenado (anti-EBUSY) ----------
+async function shutdown() {
   try {
-    const { to, sections, buttonText, title, footer, token } = req.body;
-    if (!checkToken(token)) return res.status(401).json({ error: 'Unauthorized' });
-    if (!to || !Array.isArray(sections) || sections.length === 0)
-      return res.status(400).json({ error: 'to y sections[] son requeridos' });
-
-    const list = new List(
-      'Seleccioná una opción 👇',
-      buttonText || 'Ver opciones',
-      sections,
-      title || 'FG Concept',
-      footer || 'Hair Studio'
-    );
-    const resp = await client.sendMessage(toJid(to), list);
-    res.json({ ok: true, id: resp.id.id });
+    console.log('🧹 Cerrando cliente...');
+    WA_READY = false;
+    try {
+      if (client?.pupBrowser && client.pupBrowser.isConnected()) {
+        await client.pupBrowser.close(); // soltar archivos primero
+      }
+    } catch (e) {
+      console.error('Error cerrando browser en shutdown:', e.message);
+    }
+    if (client) await client.destroy(); // cleanup de wwebjs
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    console.error('Error al cerrar cliente:', e.message);
+  } finally {
+    process.exit(0);
   }
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// ---------- Server ----------
+app.listen(PORT, () => {
+  console.log(`🚀 API escuchando en http://localhost:${PORT}`);
+  console.log(`🔑 Usando token: ${API_TOKEN}`);
+  console.log(`🧭 Chrome en: ${BROWSER_PATH}`);
 });
 
-// ---- Estado
-app.get('/status', (_req, res) => {
-  res.json({ ready: !!client.info, me: client.info?.wid?.user || null });
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`HTTP listo en :${port}`));
-
-client.initialize();
